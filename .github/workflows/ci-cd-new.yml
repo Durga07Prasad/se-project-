@@ -1,0 +1,180 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop, feature/* ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./backend
+    
+    services:
+      mongodb:
+        image: mongo:6
+        ports:
+          - 27017:27017
+
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: |
+          npm run lint
+          npx eslint . --max-warnings 0 --format json --output-file eslint-report.json
+          echo "Checking lint score..."
+          WARNINGS=$(jq '[.[] | select(.severity == 1)] | length' eslint-report.json)
+          ERRORS=$(jq '[.[] | select(.severity == 2)] | length' eslint-report.json)
+          SCORE=$(echo "10 - ($WARNINGS * 0.1 + $ERRORS * 0.5)" | bc -l)
+          echo "Lint Score: $SCORE"
+          if (( $(echo "$SCORE < 7.5" | bc -l) )); then
+            echo "Lint score below threshold (≥7.5): $SCORE"
+            exit 1
+          fi
+
+      - name: Run tests with coverage
+        env:
+          NODE_ENV: test
+          MONGODB_URI: mongodb://localhost:27017/test_db
+          JWT_SECRET: test_secret
+        run: |
+          npm run test:coverage
+          node scripts/generate-story-coverage.js
+          
+          # Check overall coverage
+          COVERAGE=$(jq '.total.lines.pct' coverage/coverage-summary.json)
+          echo "Overall Coverage: $COVERAGE%"
+          if (( $(echo "$COVERAGE < 75" | bc -l) )); then
+            echo "Coverage below threshold (75%): $COVERAGE%"
+            exit 1
+          fi
+          
+          # Check Auth coverage (80% threshold)
+          AUTH_COVERAGE=$(jq '.["src/controllers/auth.js"].lines.pct' coverage/coverage-summary.json)
+          echo "Auth Coverage: $AUTH_COVERAGE%"
+          if (( $(echo "$AUTH_COVERAGE < 80" | bc -l) )); then
+            echo "Auth coverage below threshold (80%): $AUTH_COVERAGE%"
+            exit 1
+          fi
+
+      - name: Security audit
+        run: npm audit --audit-level=moderate
+        continue-on-error: true
+
+      - name: Build
+        run: npm run build --if-present
+
+      - name: Upload backend artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-artifacts
+          path: |
+            dist/
+            coverage/
+            eslint-report.json
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./frontend
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: |
+            backend/package-lock.json
+            frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: |
+          npm run lint
+          npx eslint . --ext .js,.jsx --max-warnings 0 --format json --output-file eslint-report.json
+          echo "Checking lint score..."
+          WARNINGS=$(jq '[.[] | select(.severity == 1)] | length' eslint-report.json)
+          ERRORS=$(jq '[.[] | select(.severity == 2)] | length' eslint-report.json)
+          SCORE=$(echo "10 - ($WARNINGS * 0.1 + $ERRORS * 0.5)" | bc -l)
+          echo "Lint Score: $SCORE"
+          if (( $(echo "$SCORE < 7.5" | bc -l) )); then
+            echo "Lint score below threshold (≥7.5): $SCORE"
+            exit 1
+          fi
+
+      - name: Run tests with coverage
+        run: |
+          npm run test:coverage
+          node scripts/generate-story-coverage.js
+          
+          # Check overall coverage
+          COVERAGE=$(jq '.total.lines.pct' coverage/coverage-summary.json)
+          echo "Overall Coverage: $COVERAGE%"
+          if (( $(echo "$COVERAGE < 75" | bc -l) )); then
+            echo "Coverage below threshold (75%): $COVERAGE%"
+            exit 1
+          fi
+
+      - name: Security audit
+        run: npm audit --audit-level=moderate
+        continue-on-error: true
+
+      - name: Build
+        run: npm run build
+
+      - name: Upload frontend artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-artifacts
+          path: |
+            dist/
+            coverage/
+            eslint-report.json
+
+  quality-gate:
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate quality report
+        run: |
+          echo "## Quality Gates Summary" >> $GITHUB_STEP_SUMMARY
+          echo "### Backend" >> $GITHUB_STEP_SUMMARY
+          BACKEND_COVERAGE=$(jq '.total.lines.pct' artifacts/backend-artifacts/coverage/coverage-summary.json)
+          echo "- Coverage: $BACKEND_COVERAGE% ✅" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### Frontend" >> $GITHUB_STEP_SUMMARY
+          FRONTEND_COVERAGE=$(jq '.total.lines.pct' artifacts/frontend-artifacts/coverage/coverage-summary.json)
+          echo "- Coverage: $FRONTEND_COVERAGE% ✅" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### Overall Status" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Build: Successful" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Tests: All passed" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Coverage: Met 75% threshold" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Lint: Score ≥7.5" >> $GITHUB_STEP_SUMMARY
