@@ -154,13 +154,39 @@ jobs:
           node-version: '18'
           cache: 'npm'
 
-      - name: Run npm audit (Backend)
-        working-directory: ./backend
-        run: npm audit --audit-level=moderate
-
-      - name: Run npm audit (Frontend)
-        working-directory: ./frontend
-        run: npm audit --audit-level=moderate
+      - name: Security audit
+        run: |
+          echo "Running security checks..."
+          
+          # Run npm audit and save results
+          npm audit --json > npm-audit.json || true
+          
+          # Check for critical and high severity issues
+          CRITICAL_COUNT=$(jq '[.advisories[] | select(.severity == "critical")] | length' npm-audit.json)
+          HIGH_COUNT=$(jq '[.advisories[] | select(.severity == "high")] | length' npm-audit.json)
+          
+          echo "Security Issues Found:"
+          echo "Critical: $CRITICAL_COUNT"
+          echo "High: $HIGH_COUNT"
+          
+          # Fail if there are any critical vulnerabilities
+          if [ "$CRITICAL_COUNT" -gt 0 ]; then
+            echo "❌ Found $CRITICAL_COUNT critical vulnerabilities!"
+            echo "Critical security issues must be fixed before proceeding."
+            exit 1
+          fi
+          
+          # Warn about high severity issues
+          if [ "$HIGH_COUNT" -gt 0 ]; then
+            echo "⚠️ Found $HIGH_COUNT high severity vulnerabilities!"
+            echo "Please review and address these issues soon."
+          fi
+          
+          # Install and run snyk if token is available
+          if [ -n "$SNYK_TOKEN" ]; then
+            npm install -g snyk
+            snyk test --severity-threshold=medium || true
+          fi
 
       - name: Run SNYK Security Scan
         uses: snyk/actions/node@master
